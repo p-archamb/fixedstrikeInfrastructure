@@ -63,7 +63,6 @@ jobs:
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 8080 --cidr 0.0.0.0/0
           fi
           
           echo "Using security group: $SG_ID"
@@ -77,26 +76,25 @@ jobs:
           
           echo "Using AMI: $AMI_ID"
           
-          # Create user-data file with dynamic values
-          GITHUB_TOKEN="${{ secrets.SOURCE_REPO_PAT }}"
-          cat > user-data.sh << EOF
+          # Create a very simple user-data script for debugging
+          cat > user-data.sh << 'EOF'
           #!/bin/bash
-          export GITHUB_TOKEN="${GITHUB_TOKEN}"
-          export DB_HOST="${{ env.DB_HOST }}"
-          export DB_NAME="${{ env.DB_NAME }}"
-          export DB_USER="${{ env.DB_USER }}"
-          export DB_PASSWORD="${{ env.DB_PASSWORD }}"
-          $(cat ec2/init-scripts/ec2-init.sh)
+          echo "Instance started at $(date)" > /tmp/startup.log
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<html><body><h1>Test Instance</h1><p>This is a test instance.</p></body></html>" > /var/www/html/index.html
           EOF
           
-          # Launch instance
+          # Launch instance with minimal configuration
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
             --security-group-ids $SG_ID \
             --subnet-id $SUBNET_ID \
             --user-data file://user-data.sh \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Verification-Instance}]' \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Simple-Test-Instance}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
             
