@@ -113,29 +113,29 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
       - name: Wait for instance initialization and debug
-          id: instance initialization and debug
-          run: |
-            echo "Waiting for instance to initialize and start the application..."
-            sleep 120  # Allow time for the instance to initialize
-            
-            # Get the instance ID
-            INSTANCE_ID=${{ steps.launch-ec2.outputs.instance_id }}
-            
-            # Check instance status
-            echo "Checking instance status..."
-            aws ec2 describe-instance-status --instance-ids $INSTANCE_ID
-            
-            # Try to get system logs
-            echo "Retrieving system logs..."
-            aws ec2 get-console-output --instance-id $INSTANCE_ID
-            
-            # Check if ports are listening (using SSM)
-            echo "Checking if web server is running..."
-            aws ssm send-command \
-              --document-name "AWS-RunShellScript" \
-              --instance-ids $INSTANCE_ID \
-              --parameters commands=["netstat -tulpn | grep -E ':(80|8080)'","ps aux | grep -E '(docker|java)'","docker ps"] \
-              --output text
+        id: instance initialization and debug
+        run: |
+          echo "Waiting for instance to initialize and start the application..."
+          sleep 120  # Allow time for the instance to initialize
+          
+          # Get the instance ID
+          INSTANCE_ID=${{ steps.launch-ec2.outputs.instance_id }}
+          
+          # Check instance status
+          echo "Checking instance status..."
+          aws ec2 describe-instance-status --instance-ids $INSTANCE_ID
+          
+          # Try to get system logs
+          echo "Retrieving system logs..."
+          aws ec2 get-console-output --instance-id $INSTANCE_ID
+          
+          # Check if ports are listening (using SSM)
+          echo "Checking if web server is running..."
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --instance-ids $INSTANCE_ID \
+            --parameters commands=["netstat -tulpn | grep -E ':(80|8080)'","ps aux | grep -E '(docker|java)'","docker ps"] \
+            --output text
 
       - name: Run smoke tests
         id: smoke-tests
