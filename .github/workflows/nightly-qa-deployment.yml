@@ -127,12 +127,13 @@ jobs:
           echo "Retrieving system logs..."
           aws ec2 get-console-output --instance-id $INSTANCE_ID
           
-          # Check if ports are listening (using SSM)
-          echo "Checking if web server is running..."
+      - name: Check if web server is running
+        run: |
+          INSTANCE_ID=${{ steps.launch-ec2.outputs.instance_id }}
           aws ssm send-command \
             --document-name "AWS-RunShellScript" \
             --instance-ids $INSTANCE_ID \
-            --parameters commands=["netstat -tulpn | grep -E ':(80|8080)'","ps aux | grep -E '(docker|java)'","docker ps"] \
+            --parameters '{"commands":["netstat -tulpn | grep -E \":(80|8080)\"","ps aux | grep -E \"(docker|java)\"","docker ps"]}' \
             --output text
 
       - name: Run smoke tests
