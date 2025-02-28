@@ -110,31 +110,37 @@ jobs:
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
-      - name: Wait for instance initialization and debug
-        id: instance-initialization-and-debug
+      - name: Wait for instance initialization
         run: |
           echo "Waiting for instance to initialize and start the application..."
-          sleep 120  # Allow time for the instance to initialize
+          sleep 180  # Wait 3 minutes for initialization
           
-          # Get the instance ID
-          INSTANCE_ID=${{ steps.launch-ec2.outputs.instance_id }}
+          # Get the public IP
+          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
           
-          # Check instance status
-          echo "Checking instance status..."
-          aws ec2 describe-instance-status --instance-ids $INSTANCE_ID
+          # Check if the instance is responding to HTTP requests
+          echo "Checking if the web server is responding..."
           
-          # Try to get system logs
-          echo "Retrieving system logs..."
-          aws ec2 get-console-output --instance-id $INSTANCE_ID
+          # Try HTTP request with retries
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          HTTP_SUCCESS=false
           
-      - name: Check if web server is running
-        run: |
-          INSTANCE_ID=${{ steps.launch-ec2.outputs.instance_id }}
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --instance-ids $INSTANCE_ID \
-            --parameters '{"commands":["netstat -tulpn | grep -E \":(80|8080)\"","ps aux | grep -E \"(docker|java)\"","docker ps"]}' \
-            --output text
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HTTP_SUCCESS" = false ]; do
+            if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
+              HTTP_SUCCESS=true
+              echo "✅ Web server is responding!"
+            else
+              echo "Web server not responding yet. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
+              sleep 30
+              RETRY_COUNT=$((RETRY_COUNT+1))
+            fi
+          done
+          
+          if [ "$HTTP_SUCCESS" = false ]; then
+            echo "❌ Web server is not responding after all retries"
+            exit 1
+          fi
 
       - name: Run smoke tests
         id: smoke-tests
