@@ -1,0 +1,104 @@
+name: Nightly QA Deployment
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Runs at 2 AM UTC daily
+  workflow_dispatch:     # Also allows manual triggering
+
+env:
+  AWS_REGION: us-east-1  
+  ECR_REPOSITORY: fsv-app
+  QA_EC2_INSTANCE_ID: i-0f16adc52da0f3447
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout infrastructure repo
+        uses: actions/checkout@v3
+        
+      - name: Checkout source repo
+        uses: actions/checkout@v3
+        with:
+          repository: your-org/source-repo
+          path: source
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Launch verification EC2 instance
+        id: launch-ec2
+        run: |
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ami-0c55b159cbfafe1f0 \
+            --instance-type t2.micro \
+            --security-group-ids sg-0123456789abcdef \
+            --subnet-id subnet-0123456789abcdef \
+            --iam-instance-profile Name=EC2VerificationProfile \
+            --user-data file://ec2-init.sh \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Verification-Instance}]' \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+          echo "::set-output name=instance_id::$INSTANCE_ID"
+          
+          # Wait for instance to be running
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          
+          # Get public IP
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids $INSTANCE_ID \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "::set-output name=public_ip::$PUBLIC_IP"
+
+      - name: Wait for instance initialization
+        run: sleep 60
+          
+      - name: Run smoke tests
+        id: smoke-tests
+        run: |
+          cd source/tests
+          # Replace with your actual smoke test commands
+          npm install
+          TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests
+          
+      - name: Build and push image if tests pass
+        if: success()
+        id: build-image
+        run: |
+          cd source
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG=$(date +%Y%m%d%H%M%S)
+          
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          echo "::set-output name=image_tag::$IMAGE_TAG"
+      
+      - name: Deploy to QA EC2
+        if: success()
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
+          
+          aws ssm send-command \
+            --instance-ids ${{ env.QA_EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands=["cd /opt/deployment && ./deploy.sh $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"]
+      
+      - name: Terminate verification instance
+        if: always()
+        run: |
+          aws ec2 terminate-instances --instance-ids ${{ steps.launch-ec2.outputs.instance_id }}
