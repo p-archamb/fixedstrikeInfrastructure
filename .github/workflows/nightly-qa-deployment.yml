@@ -39,8 +39,14 @@ jobs:
       - name: Launch verification EC2 instance
         id: launch-ec2
         run: |
+          # Get the latest Amazon Linux 2 AMI
+          AMI_ID=$(aws ec2 describe-images \
+            --owners amazon \
+            --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" "Name=state,Values=available" \
+            --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+            --output text)
           INSTANCE_ID=$(aws ec2 run-instances \
-            --image-id ami-0c55b159cbfafe1f0 \
+            --image-id $AMI_ID \
             --instance-type t2.micro \
             --security-group-ids sg-0123456789abcdef \
             --subnet-id subnet-0123456789abcdef \
