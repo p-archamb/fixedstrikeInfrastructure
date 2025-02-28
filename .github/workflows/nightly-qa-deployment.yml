@@ -6,9 +6,13 @@ on:
   workflow_dispatch:     # Also allows manual triggering
 
 env:
-  AWS_REGION: us-east-1  
+  AWS_REGION: us-east-1
   ECR_REPOSITORY: fsv-app
-  QA_EC2_INSTANCE_ID: i-0f16adc52da0f3447
+  QA_EC2_INSTANCE_ID: i-0f16adc52da0f3447  # Permanent QA EC2 instance
+  DB_HOST: fixedstrike.cdgrdbxezfp6.us-east-1.rds.amazonaws.com
+  DB_NAME: fixedstrike
+  DB_USER: admin
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
 
 jobs:
   deploy:
@@ -55,10 +59,11 @@ jobs:
             echo "Creating new security group: $SG_NAME"
             SG_ID=$(aws ec2 create-security-group --group-name $SG_NAME --description "Security group for verification instances" --vpc-id $VPC_ID --query "GroupId" --output text)
             
-            # Allow SSH and HTTP/HTTPS
+            # Allow SSH, HTTP, and HTTPS
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 8080 --cidr 0.0.0.0/0
           fi
           
           echo "Using security group: $SG_ID"
@@ -72,13 +77,25 @@ jobs:
           
           echo "Using AMI: $AMI_ID"
           
-          # Launch instance without instance profile for now
+          # Create user-data file with dynamic values
+          GITHUB_TOKEN="${{ secrets.SOURCE_REPO_PAT }}"
+          cat > user-data.sh << EOF
+          #!/bin/bash
+          export GITHUB_TOKEN="${GITHUB_TOKEN}"
+          export DB_HOST="${{ env.DB_HOST }}"
+          export DB_NAME="${{ env.DB_NAME }}"
+          export DB_USER="${{ env.DB_USER }}"
+          export DB_PASSWORD="${{ env.DB_PASSWORD }}"
+          $(cat ec2/init-scripts/ec2-init.sh)
+          EOF
+          
+          # Launch instance
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
             --security-group-ids $SG_ID \
             --subnet-id $SUBNET_ID \
-            --user-data file://ec2/init-scripts/ec2-init.sh \
+            --user-data file://user-data.sh \
             --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Verification-Instance}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
@@ -95,15 +112,15 @@ jobs:
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
-
       - name: Wait for instance initialization
-        run: sleep 60
-          
+        run: |
+          echo "Waiting for instance to initialize and start the application..."
+          sleep 120  # Increased wait time to allow for application build and startup
+
       - name: Run smoke tests
         id: smoke-tests
         run: |
           cd source/tests
-          # Replace with your actual smoke test commands
           npm install
           TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests
           
@@ -120,7 +137,7 @@ jobs:
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           
-          echo "::set-output name=image_tag::$IMAGE_TAG"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
       
       - name: Deploy to QA EC2
         if: success()
