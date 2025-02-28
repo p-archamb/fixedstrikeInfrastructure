@@ -113,7 +113,7 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
       - name: Wait for instance initialization and debug
-        id: instance initialization and debug
+        id: instance-initialization-and-debug
         run: |
           echo "Waiting for instance to initialize and start the application..."
           sleep 120  # Allow time for the instance to initialize
