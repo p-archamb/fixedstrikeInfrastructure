@@ -164,16 +164,29 @@ jobs:
           
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
       
+      - name: Set up SSH for deployment
+        uses: webfactory/ssh-agent@v0.7.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
       - name: Deploy to QA EC2
         if: success()
         run: |
+          # Get the EC2 hostname from the instance ID
+          EC2_HOST=$(aws ec2 describe-instances \
+            --instance-ids ${{ env.QA_EC2_INSTANCE_ID }} \
+            --query 'Reservations[0].Instances[0].PublicDnsName' \
+            --output text)
+          
+          # Add host key
+          mkdir -p ~/.ssh
+          ssh-keyscan $EC2_HOST >> ~/.ssh/known_hosts
+          
+          # Run deployment commands via SSH
           ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
           
-          aws ssm send-command \
-            --instance-ids ${{ env.QA_EC2_INSTANCE_ID }} \
-            --document-name "AWS-RunShellScript" \
-            --parameters commands=["cd /opt/deployment && ./deploy.sh $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"]
+          ssh ec2-user@$EC2_HOST "cd /opt/deployment && ./deploy.sh $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
       
       - name: Terminate verification instance
         if: always()
