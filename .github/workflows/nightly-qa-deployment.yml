@@ -45,7 +45,7 @@ jobs:
             --security-group-ids sg-0123456789abcdef \
             --subnet-id subnet-0123456789abcdef \
             --iam-instance-profile Name=EC2VerificationProfile \
-            --user-data file://ec2-init.sh \
+            --user-data file://ec2/init-scripts/ec2-init.sh \
             --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Verification-Instance}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
