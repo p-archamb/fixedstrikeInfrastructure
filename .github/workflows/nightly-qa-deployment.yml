@@ -179,7 +179,7 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
 
-      # Wait for instance initialization with diagnostics
+      # Wait for instance initialization
       - name: Wait for instance initialization with diagnostics
         run: |
           echo "Waiting for initial instance initialization..."
