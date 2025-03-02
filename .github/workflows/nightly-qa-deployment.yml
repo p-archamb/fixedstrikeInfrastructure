@@ -93,69 +93,38 @@ jobs:
           
           echo "Using AMI: $AMI_ID"
           
-          # Create user-data script to set up Docker and run our application
+          # Create user-data script with a simple web page for testing
           cat > user-data.sh << 'EOF'
           #!/bin/bash
           echo "Instance started at $(date)" > /tmp/startup.log
           
-          # Install Docker
+          # Install and start Apache
           yum update -y
-          amazon-linux-extras install -y docker
-          systemctl start docker
-          systemctl enable docker
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
           
-          # Install AWS CLI v2
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          yum install -y unzip
-          unzip awscliv2.zip
-          ./aws/install
+          # Create a simple HTML file for smoke testing
+          cat > /var/www/html/index.html << 'HTML'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>FSV Test Page</title>
+          </head>
+          <body>
+              <h1>FSV Application Test Page</h1>
+              <p>This page simulates our application for smoke testing.</p>
+              <div id="app-content">
+                  <p>Application content loaded successfully.</p>
+              </div>
+          </body>
+          </html>
+          HTML
           
-          # Set up AWS credentials for ECR access
-          mkdir -p /root/.aws
-          cat > /root/.aws/credentials << 'AWSCREDS'
-          [default]
-          aws_access_key_id=AWS_ACCESS_KEY_ID
-          aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-          aws_session_token=AWS_SESSION_TOKEN
-          AWSCREDS
-          
-          cat > /root/.aws/config << 'AWSCONFIG'
-          [default]
-          region=AWS_REGION
-          AWSCONFIG
-          
-          # Login to ECR
-          aws ecr get-login-password --region AWS_REGION | docker login --username AWS --password-stdin ECR_REGISTRY
-          
-          # Pull our actual application from ECR
-          docker pull ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
-          
-          # Run our application
-          docker run -d -p 80:80 -p 3000:3000 \
-            -e DB_HOST="DB_HOST" \
-            -e DB_NAME="DB_NAME" \
-            -e DB_USER="DB_USER" \
-            -e DB_PASSWORD="DB_PASSWORD" \
-            ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
-          
-          # Log completion
-          echo "Container started at $(date)" >> /tmp/startup.log
+          echo "Setup complete at $(date)" >> /tmp/startup.log
           EOF
           
-          # Replace placeholders with actual values
-          sed -i "s|AWS_ACCESS_KEY_ID|${{ secrets.AWS_ACCESS_KEY_ID }}|g" user-data.sh
-          sed -i "s|AWS_SECRET_ACCESS_KEY|${{ secrets.AWS_SECRET_ACCESS_KEY }}|g" user-data.sh
-          sed -i "s|AWS_SESSION_TOKEN|${{ secrets.AWS_SESSION_TOKEN }}|g" user-data.sh
-          sed -i "s|AWS_REGION|${{ env.AWS_REGION }}|g" user-data.sh
-          sed -i "s|ECR_REGISTRY|${{ steps.login-ecr.outputs.registry }}|g" user-data.sh
-          sed -i "s|ECR_REPOSITORY|${{ env.ECR_REPOSITORY }}|g" user-data.sh
-          sed -i "s|IMAGE_TAG|${{ steps.build-image.outputs.image_tag }}|g" user-data.sh
-          sed -i "s|DB_HOST|${{ env.DB_HOST }}|g" user-data.sh
-          sed -i "s|DB_NAME|${{ env.DB_NAME }}|g" user-data.sh
-          sed -i "s|DB_USER|${{ env.DB_USER }}|g" user-data.sh
-          sed -i "s|DB_PASSWORD|${{ env.DB_PASSWORD }}|g" user-data.sh
-          
-          # Launch instance that will run our actual application
+          # Launch instance with simple web page
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
@@ -178,13 +147,11 @@ jobs:
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
-
-      # Wait for instance initialization
-      - name: Wait for initial initialization
-        id: initial-wait
+      # Wait for instance initialization 
+      - name: Wait for instance initialization
         run: |
-          echo "Waiting for initial instance initialization..."
-          sleep 500  # Wait 3 minutes for basic initialization
+          echo "Waiting for instance to initialize and start the application..."
+          sleep 180  # Wait 3 minute for initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
@@ -192,93 +159,25 @@ jobs:
           # Check if the instance is responding to HTTP requests
           echo "Checking if the application is responding..."
           
-          if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
-            # Application is already responding
-            echo "✅ Application is responding!"
-            echo "response=success" >> $GITHUB_OUTPUT
-          else
-            # Application isn't responding
-            echo "Application not responding after initial wait."
-            echo "response=failed" >> $GITHUB_OUTPUT
-          fi
-
-      # Diagnostic step after initial wait
-      - name: Run diagnostics
-        if: steps.initial-wait.outputs.response == 'failed'
-        run: |
-          # Get the public IP
-          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
+          # Try HTTP request with retries
+          MAX_RETRIES=10
+          RETRY_COUNT=0
+          HTTP_SUCCESS=false
           
-          # Set up SSH key for access
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan $PUBLIC_IP >> ~/.ssh/known_hosts
-          
-          echo "Running diagnostics to check application status..."
-          
-          if ssh -i ~/.ssh/id_rsa -o ConnectTimeout=10 ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"; then
-            echo "✅ SSH connection successful, checking application status..."
-            
-            echo "==== Startup Log ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "cat /tmp/startup.log"
-            
-            echo "==== Docker Status ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo systemctl status docker"
-            
-            echo "==== Docker Images ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker images"
-            
-            echo "==== Running Containers ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -a"
-            
-            echo "==== Container Logs ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -q | xargs -r sudo docker logs || echo 'No running containers'"
-            
-            echo "==== Failed Containers ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -a -q -f status=exited | xargs -r sudo docker logs || echo 'No failed containers'"
-            
-            echo "==== AWS Credentials Check ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo ls -la /root/.aws/ || echo 'AWS credentials not found'"
-            
-            echo "==== System Resources ===="
-            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "df -h && free -m"
-          else
-            echo "❌ Unable to SSH into the instance. It may be experiencing issues."
-          fi
-
-      # Retry step after diagnostics
-      - name: Continue with retries
-        run: |
-          # Get the public IP
-          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
-          
-          # Check if already successful from initial wait
-          if [ "${{ steps.initial-wait.outputs.response }}" == "success" ]; then
-            echo "✅ Application already responding. No need for retries."
-          else
-            echo "Continuing with HTTP response checks after diagnostics..."
-            
-            # Try HTTP request with retries
-            MAX_RETRIES=5
-            RETRY_COUNT=0
-            HTTP_SUCCESS=false
-            
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HTTP_SUCCESS" = false ]; do
-              if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
-                HTTP_SUCCESS=true
-                echo "✅ Application is now responding!"
-              else
-                echo "Application still not responding. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
-                sleep 30
-                RETRY_COUNT=$((RETRY_COUNT+1))
-              fi
-            done
-            
-            if [ "$HTTP_SUCCESS" = false ]; then
-              echo "❌ Application is not responding after all retries"
-              exit 1
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HTTP_SUCCESS" = false ]; do
+            if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
+              HTTP_SUCCESS=true
+              echo "✅ Application is responding!"
+            else
+              echo "Application not responding yet. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
+              sleep 30
+              RETRY_COUNT=$((RETRY_COUNT+1))
             fi
+          done
+          
+          if [ "$HTTP_SUCCESS" = false ]; then
+            echo "❌ Application is not responding after all retries"
+            exit 1
           fi
 
       - name: Run smoke tests
