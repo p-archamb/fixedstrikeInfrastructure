@@ -193,29 +193,18 @@ jobs:
         run: |
           ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
-          TEST_RESULT=$?
           
           if [ ${{ job.status }} == "success" ]; then
             echo "Tests passed, promoting image to production tags"
             
-            # Copy the image manifest to create proper tags
-            aws ecr put-image \
-              --repository-name ${{ env.ECR_REPOSITORY }} \
-              --image-tag $IMAGE_TAG \
-              --image-manifest $(aws ecr batch-get-image \
-                                 --repository-name ${{ env.ECR_REPOSITORY }} \
-                                 --image-ids imageTag=$IMAGE_TAG-test \
-                                 --query 'images[0].imageManifest' \
-                                 --output text)
+            # Tag the image with permanent tags using docker tag and push
+            docker pull $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG-test
+            docker tag $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG-test $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+            docker tag $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG-test $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
             
-            aws ecr put-image \
-              --repository-name ${{ env.ECR_REPOSITORY }} \
-              --image-tag latest \
-              --image-manifest $(aws ecr batch-get-image \
-                                 --repository-name ${{ env.ECR_REPOSITORY }} \
-                                 --image-ids imageTag=$IMAGE_TAG-test \
-                                 --query 'images[0].imageManifest' \
-                                 --output text)
+            # Push the permanent tags
+            docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+            docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
             
             echo "✅ Image promoted with tags: $IMAGE_TAG and latest"
           else
