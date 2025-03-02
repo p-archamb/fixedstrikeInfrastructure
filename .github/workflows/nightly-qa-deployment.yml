@@ -93,38 +93,69 @@ jobs:
           
           echo "Using AMI: $AMI_ID"
           
-          # Create user-data script with a simple web page for testing
+          # Create user-data script to set up Docker and run our application
           cat > user-data.sh << 'EOF'
           #!/bin/bash
           echo "Instance started at $(date)" > /tmp/startup.log
           
-          # Install and start Apache
+          # Install Docker
           yum update -y
-          yum install -y httpd
-          systemctl start httpd
-          systemctl enable httpd
+          amazon-linux-extras install -y docker
+          systemctl start docker
+          systemctl enable docker
           
-          # Create a simple HTML file for smoke testing
-          cat > /var/www/html/index.html << 'HTML'
-          <!DOCTYPE html>
-          <html>
-          <head>
-              <title>FSV Test Page</title>
-          </head>
-          <body>
-              <h1>FSV Application Test Page</h1>
-              <p>This page simulates our application for smoke testing.</p>
-              <div id="app-content">
-                  <p>Application content loaded successfully.</p>
-              </div>
-          </body>
-          </html>
-          HTML
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          yum install -y unzip
+          unzip awscliv2.zip
+          ./aws/install
           
-          echo "Setup complete at $(date)" >> /tmp/startup.log
+          # Set up AWS credentials for ECR access
+          mkdir -p /root/.aws
+          cat > /root/.aws/credentials << 'AWSCREDS'
+          [default]
+          aws_access_key_id=AWS_ACCESS_KEY_ID
+          aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+          aws_session_token=AWS_SESSION_TOKEN
+          AWSCREDS
+          
+          cat > /root/.aws/config << 'AWSCONFIG'
+          [default]
+          region=AWS_REGION
+          AWSCONFIG
+          
+          # Login to ECR
+          aws ecr get-login-password --region AWS_REGION | docker login --username AWS --password-stdin ECR_REGISTRY
+          
+          # Pull our actual application from ECR
+          docker pull ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
+          
+          # Run our application
+          docker run -d -p 80:80 -p 3000:3000 \
+            -e DB_HOST="DB_HOST" \
+            -e DB_NAME="DB_NAME" \
+            -e DB_USER="DB_USER" \
+            -e DB_PASSWORD="DB_PASSWORD" \
+            ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
+          
+          # Log completion
+          echo "Container started at $(date)" >> /tmp/startup.log
           EOF
           
-          # Launch instance with simple web page
+          # Replace placeholders with actual values
+          sed -i "s|AWS_ACCESS_KEY_ID|${{ secrets.AWS_ACCESS_KEY_ID }}|g" user-data.sh
+          sed -i "s|AWS_SECRET_ACCESS_KEY|${{ secrets.AWS_SECRET_ACCESS_KEY }}|g" user-data.sh
+          sed -i "s|AWS_SESSION_TOKEN|${{ secrets.AWS_SESSION_TOKEN }}|g" user-data.sh
+          sed -i "s|AWS_REGION|${{ env.AWS_REGION }}|g" user-data.sh
+          sed -i "s|ECR_REGISTRY|${{ steps.login-ecr.outputs.registry }}|g" user-data.sh
+          sed -i "s|ECR_REPOSITORY|${{ env.ECR_REPOSITORY }}|g" user-data.sh
+          sed -i "s|IMAGE_TAG|${{ steps.build-image.outputs.image_tag }}|g" user-data.sh
+          sed -i "s|DB_HOST|${{ env.DB_HOST }}|g" user-data.sh
+          sed -i "s|DB_NAME|${{ env.DB_NAME }}|g" user-data.sh
+          sed -i "s|DB_USER|${{ env.DB_USER }}|g" user-data.sh
+          sed -i "s|DB_PASSWORD|${{ env.DB_PASSWORD }}|g" user-data.sh
+          
+          # Launch instance that will run our actual application
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
@@ -147,11 +178,12 @@ jobs:
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
+
       # Wait for instance initialization 
       - name: Wait for instance initialization
         run: |
           echo "Waiting for instance to initialize and start the application..."
-          sleep 30  # Wait 1 minute for initialization
+          sleep 180  # Wait 3 minutes for initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
