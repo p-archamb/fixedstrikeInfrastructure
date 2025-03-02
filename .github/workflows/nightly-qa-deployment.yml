@@ -179,11 +179,11 @@ jobs:
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
 
-      # Wait for instance initialization 
-      - name: Wait for instance initialization
+      # Wait for instance initialization with diagnostics
+      - name: Wait for instance initialization with diagnostics
         run: |
-          echo "Waiting for instance to initialize and start the application..."
-          sleep 180  # Wait 3 minutes for initialization
+          echo "Waiting for initial instance initialization..."
+          sleep 180  # Wait 3 minutes for basic initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
@@ -191,25 +191,95 @@ jobs:
           # Check if the instance is responding to HTTP requests
           echo "Checking if the application is responding..."
           
-          # Try HTTP request with retries
-          MAX_RETRIES=10
-          RETRY_COUNT=0
-          HTTP_SUCCESS=false
-          
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HTTP_SUCCESS" = false ]; do
-            if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
-              HTTP_SUCCESS=true
-              echo "✅ Application is responding!"
+          if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
+            # Application is already responding
+            echo "✅ Application is responding!"
+          else
+            # Application isn't responding, run diagnostic to see what's happening
+            echo "Application not responding after initial wait. Running diagnostics..."
+            
+            # Set up SSH key for access
+            mkdir -p ~/.ssh
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+            ssh-keyscan $PUBLIC_IP >> ~/.ssh/known_hosts
+            
+            # Try to SSH into the instance
+            if ssh -i ~/.ssh/id_rsa -o ConnectTimeout=10 ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"; then
+              echo "✅ SSH connection successful, checking application status..."
+              
+              # Check logs and Docker status
+              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP << 'EOF'
+                echo "==== Startup Log ===="
+                cat /tmp/startup.log
+                
+                echo "==== Docker Status ===="
+                sudo systemctl status docker
+                
+                echo "==== Docker Images ===="
+                sudo docker images
+                
+                echo "==== Running Containers ===="
+                sudo docker ps -a
+                
+                echo "==== Container Logs ===="
+                CONTAINER_ID=$(sudo docker ps -q)
+                if [ -n "$CONTAINER_ID" ]; then
+                  sudo docker logs $CONTAINER_ID
+                else
+                  echo "No running containers found"
+                  echo "==== Failed Containers ===="
+                  FAILED_CONTAINER=$(sudo docker ps -a -q -f status=exited)
+                  if [ -n "$FAILED_CONTAINER" ]; then
+                    echo "Found exited container: $FAILED_CONTAINER"
+                    sudo docker logs $FAILED_CONTAINER
+                  else
+                    echo "No exited containers found"
+                  fi
+                fi
+                
+                echo "==== Check AWS credentials ===="
+                sudo cat /root/.aws/credentials | grep -v AWS_SECRET_ACCESS_KEY | grep -v AWS_SESSION_TOKEN
+                
+                echo "==== ECR Login Check ===="
+                sudo grep "login" /tmp/startup.log
+                
+                echo "==== Disk Space ===="
+                df -h
+                
+                echo "==== Memory Usage ===="
+                free -m
+                
+                echo "==== Network Connections ===="
+                sudo netstat -tulpn | grep LISTEN
+              EOF
             else
-              echo "Application not responding yet. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
-              sleep 30
-              RETRY_COUNT=$((RETRY_COUNT+1))
+              echo "❌ Unable to SSH into the instance. It may be experiencing issues."
             fi
-          done
-          
-          if [ "$HTTP_SUCCESS" = false ]; then
-            echo "❌ Application is not responding after all retries"
-            exit 1
+            
+            # Continue with retries after diagnostics
+            echo "Continuing with HTTP response checks after diagnostics..."
+            
+            # Try HTTP request with retries
+            MAX_RETRIES=5
+            RETRY_COUNT=0
+            HTTP_SUCCESS=false
+            
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HTTP_SUCCESS" = false ]; do
+              if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
+                HTTP_SUCCESS=true
+                echo "✅ Application is now responding!"
+              else
+                echo "Application still not responding. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
+                sleep 30
+                RETRY_COUNT=$((RETRY_COUNT+1))
+              fi
+            done
+            
+            if [ "$HTTP_SUCCESS" = false ]; then
+              echo "❌ Application is not responding after all retries"
+              exit 1
+            fi
           fi
 
       - name: Run smoke tests
