@@ -184,7 +184,7 @@ jobs:
         id: initial-wait
         run: |
           echo "Waiting for initial instance initialization..."
-          sleep 180  # Wait 3 minutes for basic initialization
+          sleep 500  # Wait 3 minutes for basic initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
