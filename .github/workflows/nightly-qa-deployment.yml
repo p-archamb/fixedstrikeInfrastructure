@@ -208,51 +208,51 @@ jobs:
             if ssh -i ~/.ssh/id_rsa -o ConnectTimeout=10 ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"; then
               echo "✅ SSH connection successful, checking application status..."
               
-              # Check logs and Docker status
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP << 'EOF'
-                echo "==== Startup Log ===="
-                cat /tmp/startup.log
-                
-                echo "==== Docker Status ===="
-                sudo systemctl status docker
-                
-                echo "==== Docker Images ===="
-                sudo docker images
-                
-                echo "==== Running Containers ===="
-                sudo docker ps -a
-                
-                echo "==== Container Logs ===="
-                CONTAINER_ID=$(sudo docker ps -q)
-                if [ -n "$CONTAINER_ID" ]; then
-                  sudo docker logs $CONTAINER_ID
-                else
-                  echo "No running containers found"
-                  echo "==== Failed Containers ===="
-                  FAILED_CONTAINER=$(sudo docker ps -a -q -f status=exited)
-                  if [ -n "$FAILED_CONTAINER" ]; then
-                    echo "Found exited container: $FAILED_CONTAINER"
-                    sudo docker logs $FAILED_CONTAINER
-                  else
-                    echo "No exited containers found"
-                  fi
-                fi
-                
-                echo "==== Check AWS credentials ===="
-                sudo cat /root/.aws/credentials | grep -v AWS_SECRET_ACCESS_KEY | grep -v AWS_SESSION_TOKEN
-                
-                echo "==== ECR Login Check ===="
-                sudo grep "login" /tmp/startup.log
-                
-                echo "==== Disk Space ===="
-                df -h
-                
-                echo "==== Memory Usage ===="
-                free -m
-                
-                echo "==== Network Connections ===="
-                sudo netstat -tulpn | grep LISTEN
-              EOF
+              # Check logs and Docker status - properly closed heredoc
+              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP << EOF
+      echo "==== Startup Log ===="
+      cat /tmp/startup.log
+
+      echo "==== Docker Status ===="
+      sudo systemctl status docker
+
+      echo "==== Docker Images ===="
+      sudo docker images
+
+      echo "==== Running Containers ===="
+      sudo docker ps -a
+
+      echo "==== Container Logs ===="
+      CONTAINER_ID=\$(sudo docker ps -q)
+      if [ -n "\$CONTAINER_ID" ]; then
+        sudo docker logs \$CONTAINER_ID
+      else
+        echo "No running containers found"
+        echo "==== Failed Containers ===="
+        FAILED_CONTAINER=\$(sudo docker ps -a -q -f status=exited)
+        if [ -n "\$FAILED_CONTAINER" ]; then
+          echo "Found exited container: \$FAILED_CONTAINER"
+          sudo docker logs \$FAILED_CONTAINER
+        else
+          echo "No exited containers found"
+        fi
+      fi
+
+      echo "==== Check AWS credentials ===="
+      sudo cat /root/.aws/credentials | grep -v AWS_SECRET_ACCESS_KEY | grep -v AWS_SESSION_TOKEN
+
+      echo "==== ECR Login Check ===="
+      sudo grep "login" /tmp/startup.log
+
+      echo "==== Disk Space ===="
+      df -h
+
+      echo "==== Memory Usage ===="
+      free -m
+
+      echo "==== Network Connections ===="
+      sudo netstat -tulpn | grep LISTEN
+      EOF
             else
               echo "❌ Unable to SSH into the instance. It may be experiencing issues."
             fi
