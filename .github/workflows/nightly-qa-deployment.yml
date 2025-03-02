@@ -151,7 +151,7 @@ jobs:
       - name: Wait for instance initialization
         run: |
           echo "Waiting for instance to initialize and start the application..."
-          sleep 60  # Wait 1 minute for initialization
+          sleep 30  # Wait 1 minute for initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
@@ -206,7 +206,12 @@ jobs:
             docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
             docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
             
-            echo "✅ Image promoted with tags: $IMAGE_TAG and latest"
+            # Remove the test tag after successful promotion
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-ids imageTag=$IMAGE_TAG-test
+            
+            echo "✅ Image promoted with tags: $IMAGE_TAG and latest, test tag removed"
           else
             echo "Tests failed, removing test image"
             
