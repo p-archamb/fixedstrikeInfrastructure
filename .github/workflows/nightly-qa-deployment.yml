@@ -36,9 +36,15 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
       
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+      - name: Build application image locally
+        id: build-image
+        run: |
+          cd source
+          IMAGE_TAG=$(date +%Y%m%d%H%M%S)
+          
+          docker build -t fsv-app:$IMAGE_TAG .
+          
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
       
       - name: Launch verification EC2 instance
         id: launch-ec2
@@ -63,6 +69,7 @@ jobs:
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
             aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0
+            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0
           fi
           
           echo "Using security group: $SG_ID"
@@ -76,25 +83,27 @@ jobs:
           
           echo "Using AMI: $AMI_ID"
           
-          # Create a very simple user-data script for debugging
+          # Create user-data script to set up Docker
           cat > user-data.sh << 'EOF'
           #!/bin/bash
           echo "Instance started at $(date)" > /tmp/startup.log
           yum update -y
-          yum install -y httpd
-          systemctl start httpd
-          systemctl enable httpd
-          echo "<html><body><h1>Test Instance</h1><p>This is a test instance.</p></body></html>" > /var/www/html/index.html
+          amazon-linux-extras install -y docker
+          systemctl start docker
+          systemctl enable docker
+          
+          # Create directories for the app
+          mkdir -p /opt/app
           EOF
           
-          # Launch instance with minimal configuration
+          # Launch instance for verification
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
             --security-group-ids $SG_ID \
             --subnet-id $SUBNET_ID \
             --user-data file://user-data.sh \
-            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=Simple-Test-Instance}]' \
+            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=App-Verification-Instance}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
             
@@ -109,17 +118,61 @@ jobs:
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
-
-      - name: Wait for instance initialization
+          
+          # Wait for instance to be ready for SSH
+          echo "Waiting for instance to be ready for SSH..."
+          while ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP echo "SSH connection successful" 2>/dev/null; do
+            echo "Waiting for SSH connection..."
+            sleep 10
+          done
+      
+      - name: Set up SSH key
         run: |
-          echo "Waiting for instance to initialize and start the application..."
-          sleep 180  # Wait 3 minutes for initialization
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan ${{ steps.launch-ec2.outputs.public_ip }} >> ~/.ssh/known_hosts
+      
+      # Step 4: Save Docker image as tar, copy to EC2, and run
+      - name: Deploy application to verification EC2
+        run: |
+          # Save the Docker image to a tar file
+          IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
+          docker save fsv-app:$IMAGE_TAG -o app-image.tar
+          
+          # Copy the image to the EC2 instance
+          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
+          scp -i ~/.ssh/id_rsa app-image.tar ec2-user@$PUBLIC_IP:/tmp/
+          
+          # Load and run the Docker image on the EC2 instance
+          ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP << EOF
+            # Load the Docker image
+            sudo docker load -i /tmp/app-image.tar
+            
+            # Run the application container
+            sudo docker run -d -p 80:80 -p 3000:3000 \
+              -e DB_HOST="${{ env.DB_HOST }}" \
+              -e DB_NAME="${{ env.DB_NAME }}" \
+              -e DB_USER="${{ env.DB_USER }}" \
+              -e DB_PASSWORD="${{ env.DB_PASSWORD }}" \
+              fsv-app:$IMAGE_TAG
+            
+            # Remove the image tar to save space
+            rm /tmp/app-image.tar
+          EOF
+          
+          echo "Application deployed to verification EC2 instance"
+
+      - name: Wait for application to start
+        run: |
+          echo "Waiting for application to initialize..."
+          sleep 60  # Initial wait
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
           
-          # Check if the instance is responding to HTTP requests
-          echo "Checking if the web server is responding..."
+          # Check if the application is responding to HTTP requests
+          echo "Checking if the application is responding..."
           
           # Try HTTP request with retries
           MAX_RETRIES=10
@@ -129,16 +182,16 @@ jobs:
           while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$HTTP_SUCCESS" = false ]; do
             if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
               HTTP_SUCCESS=true
-              echo "✅ Web server is responding!"
+              echo "✅ Application is responding!"
             else
-              echo "Web server not responding yet. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
+              echo "Application not responding yet. Retrying ($((RETRY_COUNT+1))/$MAX_RETRIES)..."
               sleep 30
               RETRY_COUNT=$((RETRY_COUNT+1))
             fi
           done
           
           if [ "$HTTP_SUCCESS" = false ]; then
-            echo "❌ Web server is not responding after all retries"
+            echo "❌ Application is not responding after all retries"
             exit 1
           fi
 
@@ -149,22 +202,30 @@ jobs:
           npm install
           TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests
           
-      - name: Build and push image if tests pass
+      # Login to ECR and push image only if smoke tests pass
+      - name: Login to Amazon ECR
         if: success()
-        id: build-image
-        run: |
-          cd source
-          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG=$(date +%Y%m%d%H%M%S)
-          
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          
-          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
       
-      - name: Set up SSH for deployment
+      - name: Push image to ECR if tests pass
+        if: success()
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
+          
+          # Tag the image for ECR
+          docker tag fsv-app:$IMAGE_TAG $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker tag fsv-app:$IMAGE_TAG $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          
+          # Push images to ECR
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          
+          echo "✅ Images pushed to ECR: $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG and :latest"
+          
+      - name: Set up SSH for QA deployment
+        if: success()
         uses: webfactory/ssh-agent@v0.7.0
         with:
           ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -191,7 +252,7 @@ jobs:
                                 export AWS_SESSION_TOKEN='${{ secrets.AWS_SESSION_TOKEN }}' && \
                                 export AWS_DEFAULT_REGION='${{ env.AWS_REGION }}' && \
                                 cd /opt/deployment && \
-                                ./deploy.sh $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+                                ./deploy.sh $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
       
       - name: Terminate verification instance
         if: always()
