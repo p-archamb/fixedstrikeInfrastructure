@@ -180,7 +180,8 @@ jobs:
 
 
       # Wait for instance initialization
-      - name: Wait for instance initialization with diagnostics
+      - name: Wait for initial initialization
+        id: initial-wait
         run: |
           echo "Waiting for initial instance initialization..."
           sleep 180  # Wait 3 minutes for basic initialization
@@ -194,75 +195,68 @@ jobs:
           if curl -s -m 10 http://$PUBLIC_IP/ > /dev/null; then
             # Application is already responding
             echo "✅ Application is responding!"
+            echo "response=success" >> $GITHUB_OUTPUT
           else
-            # Application isn't responding, run diagnostic to see what's happening
-            echo "Application not responding after initial wait. Running diagnostics..."
+            # Application isn't responding
+            echo "Application not responding after initial wait."
+            echo "response=failed" >> $GITHUB_OUTPUT
+          fi
+
+      # Diagnostic step after initial wait
+      - name: Run diagnostics
+        if: steps.initial-wait.outputs.response == 'failed'
+        run: |
+          # Get the public IP
+          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
+          
+          # Set up SSH key for access
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan $PUBLIC_IP >> ~/.ssh/known_hosts
+          
+          echo "Running diagnostics to check application status..."
+          
+          if ssh -i ~/.ssh/id_rsa -o ConnectTimeout=10 ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"; then
+            echo "✅ SSH connection successful, checking application status..."
             
-            # Set up SSH key for access
-            mkdir -p ~/.ssh
-            echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-            chmod 600 ~/.ssh/id_rsa
-            ssh-keyscan $PUBLIC_IP >> ~/.ssh/known_hosts
+            echo "==== Startup Log ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "cat /tmp/startup.log"
             
-            # Try to SSH into the instance and run individual commands
-            if ssh -i ~/.ssh/id_rsa -o ConnectTimeout=10 ec2-user@$PUBLIC_IP "echo 'SSH connection successful'"; then
-              echo "✅ SSH connection successful, checking application status..."
-              
-              # Check startup log
-              echo "==== Startup Log ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "cat /tmp/startup.log"
-              
-              # Check Docker status
-              echo "==== Docker Status ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo systemctl status docker"
-              
-              # Check Docker images
-              echo "==== Docker Images ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker images"
-              
-              # Check running containers
-              echo "==== Running Containers ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -a"
-              
-              # Check running container logs
-              echo "==== Container Logs ===="
-              CONTAINER_ID=$(ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -q")
-              if [ -n "$CONTAINER_ID" ]; then
-                ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker logs $CONTAINER_ID"
-              else
-                echo "No running containers found"
-                
-                # Check failed containers
-                echo "==== Failed Containers ===="
-                FAILED_CONTAINER=$(ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -a -q -f status=exited")
-                if [ -n "$FAILED_CONTAINER" ]; then
-                  echo "Found exited container: $FAILED_CONTAINER"
-                  ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker logs $FAILED_CONTAINER"
-                else
-                  echo "No exited containers found"
-                fi
-              fi
-              
-              # Check AWS credentials existence
-              echo "==== Check AWS credentials ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo ls -la /root/.aws/"
-              
-              # Check disk space
-              echo "==== Disk Space ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "df -h"
-              
-              # Check memory usage
-              echo "==== Memory Usage ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "free -m"
-              
-              # Check network connections
-              echo "==== Network Connections ===="
-              ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo netstat -tulpn | grep LISTEN"
-            else
-              echo "❌ Unable to SSH into the instance. It may be experiencing issues."
-            fi
+            echo "==== Docker Status ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo systemctl status docker"
             
-            # Continue with retries after diagnostics
+            echo "==== Docker Images ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker images"
+            
+            echo "==== Running Containers ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -a"
+            
+            echo "==== Container Logs ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -q | xargs -r sudo docker logs || echo 'No running containers'"
+            
+            echo "==== Failed Containers ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo docker ps -a -q -f status=exited | xargs -r sudo docker logs || echo 'No failed containers'"
+            
+            echo "==== AWS Credentials Check ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "sudo ls -la /root/.aws/ || echo 'AWS credentials not found'"
+            
+            echo "==== System Resources ===="
+            ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP "df -h && free -m"
+          else
+            echo "❌ Unable to SSH into the instance. It may be experiencing issues."
+          fi
+
+      # Retry step after diagnostics
+      - name: Continue with retries
+        run: |
+          # Get the public IP
+          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
+          
+          # Check if already successful from initial wait
+          if [ "${{ steps.initial-wait.outputs.response }}" == "success" ]; then
+            echo "✅ Application already responding. No need for retries."
+          else
             echo "Continuing with HTTP response checks after diagnostics..."
             
             # Try HTTP request with retries
