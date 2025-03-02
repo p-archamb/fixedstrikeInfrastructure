@@ -36,13 +36,23 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
       
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      # Build the application locally and push to ECR
       - name: Build application image locally
         id: build-image
         run: |
           cd source
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG=$(date +%Y%m%d%H%M%S)
           
-          docker build -t fsv-app:$IMAGE_TAG .
+          # Build the image
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG-test .
+          
+          # Push to ECR with a test tag (will be removed if tests fail)
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG-test
           
           echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
       
@@ -83,20 +93,58 @@ jobs:
           
           echo "Using AMI: $AMI_ID"
           
-          # Create user-data script to set up Docker
+          # Create user-data script that pulls and runs our actual app
           cat > user-data.sh << 'EOF'
           #!/bin/bash
           echo "Instance started at $(date)" > /tmp/startup.log
+          
+          # Install Docker
           yum update -y
           amazon-linux-extras install -y docker
           systemctl start docker
           systemctl enable docker
           
-          # Create directories for the app
-          mkdir -p /opt/app
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          yum install -y unzip
+          unzip awscliv2.zip
+          ./aws/install
+          
+          # Set environment variables for AWS CLI
+          export AWS_DEFAULT_REGION="AWS_REGION"
+          export AWS_ACCESS_KEY_ID="AWS_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="AWS_SECRET_ACCESS_KEY"
+          export AWS_SESSION_TOKEN="AWS_SESSION_TOKEN"
+          
+          # Login to ECR
+          aws ecr get-login-password | docker login --username AWS --password-stdin ECR_REGISTRY
+          
+          # Pull our actual application image
+          docker pull ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
+          
+          # Run our actual application
+          docker run -d -p 80:80 -p 3000:3000 \
+            -e DB_HOST="DB_HOST" \
+            -e DB_NAME="DB_NAME" \
+            -e DB_USER="DB_USER" \
+            -e DB_PASSWORD="DB_PASSWORD" \
+            ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
           EOF
           
-          # Launch instance for verification
+          # Replace placeholders with actual values
+          sed -i "s|AWS_REGION|${{ env.AWS_REGION }}|g" user-data.sh
+          sed -i "s|AWS_ACCESS_KEY_ID|${{ secrets.AWS_ACCESS_KEY_ID }}|g" user-data.sh
+          sed -i "s|AWS_SECRET_ACCESS_KEY|${{ secrets.AWS_SECRET_ACCESS_KEY }}|g" user-data.sh
+          sed -i "s|AWS_SESSION_TOKEN|${{ secrets.AWS_SESSION_TOKEN }}|g" user-data.sh
+          sed -i "s|ECR_REGISTRY|${{ steps.login-ecr.outputs.registry }}|g" user-data.sh
+          sed -i "s|ECR_REPOSITORY|${{ env.ECR_REPOSITORY }}|g" user-data.sh
+          sed -i "s|IMAGE_TAG|${{ steps.build-image.outputs.image_tag }}|g" user-data.sh
+          sed -i "s|DB_HOST|${{ env.DB_HOST }}|g" user-data.sh
+          sed -i "s|DB_NAME|${{ env.DB_NAME }}|g" user-data.sh
+          sed -i "s|DB_USER|${{ env.DB_USER }}|g" user-data.sh
+          sed -i "s|DB_PASSWORD|${{ env.DB_PASSWORD }}|g" user-data.sh
+          
+          # Launch instance with our actual application
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
@@ -118,60 +166,17 @@ jobs:
             --query 'Reservations[0].Instances[0].PublicIpAddress' \
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
-          
-          # Wait for instance to be ready for SSH
-          echo "Waiting for instance to be ready for SSH..."
-          while ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP echo "SSH connection successful" 2>/dev/null; do
-            echo "Waiting for SSH connection..."
-            sleep 10
-          done
-      
-      - name: Set up SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan ${{ steps.launch-ec2.outputs.public_ip }} >> ~/.ssh/known_hosts
-      
-      # Step 4: Save Docker image as tar, copy to EC2, and run
-      - name: Deploy application to verification EC2
-        run: |
-          # Save the Docker image to a tar file
-          IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
-          docker save fsv-app:$IMAGE_TAG -o app-image.tar
-          
-          # Copy the image to the EC2 instance
-          PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
-          scp -i ~/.ssh/id_rsa app-image.tar ec2-user@$PUBLIC_IP:/tmp/
-          
-          # Load and run the Docker image on the EC2 instance
-          ssh -i ~/.ssh/id_rsa ec2-user@$PUBLIC_IP << EOF
-            # Load the Docker image
-            sudo docker load -i /tmp/app-image.tar
-            
-            # Run the application container
-            sudo docker run -d -p 80:80 -p 3000:3000 \
-              -e DB_HOST="${{ env.DB_HOST }}" \
-              -e DB_NAME="${{ env.DB_NAME }}" \
-              -e DB_USER="${{ env.DB_USER }}" \
-              -e DB_PASSWORD="${{ env.DB_PASSWORD }}" \
-              fsv-app:$IMAGE_TAG
-            
-            # Remove the image tar to save space
-            rm /tmp/app-image.tar
-          EOF
-          
-          echo "Application deployed to verification EC2 instance"
 
-      - name: Wait for application to start
+      # Wait for instance initialization 
+      - name: Wait for instance initialization
         run: |
-          echo "Waiting for application to initialize..."
-          sleep 60  # Initial wait
+          echo "Waiting for instance to initialize and start the application..."
+          sleep 180  # Wait 3 minutes for initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
           
-          # Check if the application is responding to HTTP requests
+          # Check if the instance is responding to HTTP requests
           echo "Checking if the application is responding..."
           
           # Try HTTP request with retries
@@ -201,29 +206,51 @@ jobs:
           cd source/tests
           npm install
           TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests
-          
-      # Login to ECR and push image only if smoke tests pass
-      - name: Login to Amazon ECR
-        if: success()
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
       
-      - name: Push image to ECR if tests pass
-        if: success()
+      # If tests pass, promote the image by re-tagging, if tests fail, delete the test image
+      - name: Promote or delete image based on test results
+        if: always()
         run: |
           ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG=${{ steps.build-image.outputs.image_tag }}
+          TEST_RESULT=$?
           
-          # Tag the image for ECR
-          docker tag fsv-app:$IMAGE_TAG $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
-          docker tag fsv-app:$IMAGE_TAG $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
+          if [ ${{ job.status }} == "success" ]; then
+            echo "Tests passed, promoting image to production tags"
+            
+            # Copy the image manifest to create proper tags
+            aws ecr put-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-tag $IMAGE_TAG \
+              --image-manifest $(aws ecr batch-get-image \
+                                 --repository-name ${{ env.ECR_REPOSITORY }} \
+                                 --image-ids imageTag=$IMAGE_TAG-test \
+                                 --query 'images[0].imageManifest' \
+                                 --output text)
+            
+            aws ecr put-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-tag latest \
+              --image-manifest $(aws ecr batch-get-image \
+                                 --repository-name ${{ env.ECR_REPOSITORY }} \
+                                 --image-ids imageTag=$IMAGE_TAG-test \
+                                 --query 'images[0].imageManifest' \
+                                 --output text)
+            
+            echo "✅ Image promoted with tags: $IMAGE_TAG and latest"
+          else
+            echo "Tests failed, removing test image"
+            
+            # Delete the test image
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.ECR_REPOSITORY }} \
+              --image-ids imageTag=$IMAGE_TAG-test
+            
+            echo "❌ Test image removed from ECR"
+            exit 1
+          fi
           
-          # Push images to ECR
-          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
-          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
-          
-          echo "✅ Images pushed to ECR: $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG and :latest"
-          
+      # Deploy to QA EC2 if tests pass
       - name: Set up SSH for QA deployment
         if: success()
         uses: webfactory/ssh-agent@v0.7.0
@@ -254,6 +281,7 @@ jobs:
                                 cd /opt/deployment && \
                                 ./deploy.sh $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG"
       
+      # Step 8: Always clean up the verification instance
       - name: Terminate verification instance
         if: always()
         run: |
