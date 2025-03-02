@@ -171,7 +171,7 @@ jobs:
       - name: Wait for instance initialization
         run: |
           echo "Waiting for instance to initialize and start the application..."
-          sleep 180  # Wait 3 minutes for initialization
+          sleep 60  # Wait 1 minute for initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
