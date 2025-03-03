@@ -59,30 +59,13 @@ jobs:
       - name: Launch verification EC2 instance
         id: launch-ec2
         run: |
-          # Get default VPC ID
-          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
-          echo "Using default VPC: $VPC_ID"
+          # Use same VPC ID as RDS to allow connectivity
+          VPC_ID=${{ secrets.VPC_ID }}
           
-          # Get first subnet in default VPC
-          SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[0].SubnetId" --output text)
-          echo "Using subnet: $SUBNET_ID"
+          SUBNET_ID=${{ secrets.SUBNET_ID }}
           
-          # Get or create security group
-          SG_NAME="verification-instance-sg"
-          SG_ID=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text)
-          
-          if [ "$SG_ID" = "None" ] || [ -z "$SG_ID" ]; then
-            echo "Creating new security group: $SG_NAME"
-            SG_ID=$(aws ec2 create-security-group --group-name $SG_NAME --description "Security group for verification instances" --vpc-id $VPC_ID --query "GroupId" --output text)
-            
-            # Allow SSH, HTTP, and HTTPS
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 22 --cidr 0.0.0.0/0
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 443 --cidr 0.0.0.0/0
-            aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0
-          fi
-          
-          echo "Using security group: $SG_ID"
+          # Use QA EC2 SG_ID, since it has access to the private RDS
+          SG_ID=${{ secrets.SG_ID }}
           
           # Get the latest Amazon Linux 2 AMI
           AMI_ID=$(aws ec2 describe-images \
@@ -90,41 +73,69 @@ jobs:
             --filters "Name=name,Values=amzn2-ami-hvm-2.0.*-x86_64-gp2" "Name=state,Values=available" \
             --query "sort_by(Images, &CreationDate)[-1].ImageId" \
             --output text)
-          
           echo "Using AMI: $AMI_ID"
           
-          # Create user-data script with a simple web page for testing
+          # Create user-data script to run the application
           cat > user-data.sh << 'EOF'
           #!/bin/bash
           echo "Instance started at $(date)" > /tmp/startup.log
           
-          # Install and start Apache
+          # Install Docker
           yum update -y
-          yum install -y httpd
-          systemctl start httpd
-          systemctl enable httpd
+          amazon-linux-extras install -y docker
+          systemctl start docker
+          systemctl enable docker
           
-          # Create a simple HTML file for smoke testing
-          cat > /var/www/html/index.html << 'HTML'
-          <!DOCTYPE html>
-          <html>
-          <head>
-              <title>FSV Test Page</title>
-          </head>
-          <body>
-              <h1>FSV Application Test Page</h1>
-              <p>This page simulates our application for smoke testing.</p>
-              <div id="app-content">
-                  <p>Application content loaded successfully.</p>
-              </div>
-          </body>
-          </html>
-          HTML
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          yum install -y unzip
+          unzip awscliv2.zip
+          ./aws/install
+          
+          # Set up AWS credentials for ECR access
+          mkdir -p /root/.aws
+          cat > /root/.aws/credentials << 'AWSCREDS'
+          [default]
+          aws_access_key_id=AWS_ACCESS_KEY_ID
+          aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+          aws_session_token=AWS_SESSION_TOKEN
+          AWSCREDS
+          
+          cat > /root/.aws/config << 'AWSCONFIG'
+          [default]
+          region=AWS_REGION
+          AWSCONFIG
+          
+          # Login to ECR
+          aws ecr get-login-password --region AWS_REGION | docker login --username AWS --password-stdin ECR_REGISTRY
+          
+          # Pull our actual application from ECR
+          docker pull ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
+          
+          # Run our application
+          docker run -d -p 80:8080 \
+            -e SPRING_DATASOURCE_URL="jdbc:mysql://DB_HOST:3306/DB_NAME" \
+            -e SPRING_DATASOURCE_USERNAME="DB_USER" \
+            -e SPRING_DATASOURCE_PASSWORD="DB_PASSWORD" \
+            ECR_REGISTRY/ECR_REPOSITORY:IMAGE_TAG-test
           
           echo "Setup complete at $(date)" >> /tmp/startup.log
           EOF
           
-          # Launch instance with simple web page
+          # Replace placeholders with actual values
+          sed -i "s|AWS_ACCESS_KEY_ID|${{ secrets.AWS_ACCESS_KEY_ID }}|g" user-data.sh
+          sed -i "s|AWS_SECRET_ACCESS_KEY|${{ secrets.AWS_SECRET_ACCESS_KEY }}|g" user-data.sh
+          sed -i "s|AWS_SESSION_TOKEN|${{ secrets.AWS_SESSION_TOKEN }}|g" user-data.sh
+          sed -i "s|AWS_REGION|${{ env.AWS_REGION }}|g" user-data.sh
+          sed -i "s|ECR_REGISTRY|${{ steps.login-ecr.outputs.registry }}|g" user-data.sh
+          sed -i "s|ECR_REPOSITORY|${{ env.ECR_REPOSITORY }}|g" user-data.sh
+          sed -i "s|IMAGE_TAG|${{ steps.build-image.outputs.image_tag }}|g" user-data.sh
+          sed -i "s|DB_HOST|${{ env.DB_HOST }}|g" user-data.sh
+          sed -i "s|DB_NAME|${{ env.DB_NAME }}|g" user-data.sh
+          sed -i "s|DB_USER|${{ env.DB_USER }}|g" user-data.sh
+          sed -i "s|DB_PASSWORD|${{ secrets.DB_PASSWORD }}|g" user-data.sh
+          
+          # Launch instance with actual application
           INSTANCE_ID=$(aws ec2 run-instances \
             --image-id $AMI_ID \
             --instance-type t2.micro \
@@ -134,7 +145,7 @@ jobs:
             --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=App-Verification-Instance}]' \
             --query 'Instances[0].InstanceId' \
             --output text)
-            
+          
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
           
           # Wait for instance to be running
@@ -147,11 +158,10 @@ jobs:
             --output text)
           echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
 
-      # Wait for instance initialization 
       - name: Wait for instance initialization
         run: |
           echo "Waiting for instance to initialize and start the application..."
-          sleep 180  # Wait 3 minute for initialization
+          sleep 180  # Wait 3 minutes for initialization
           
           # Get the public IP
           PUBLIC_IP=${{ steps.launch-ec2.outputs.public_ip }}
@@ -180,15 +190,12 @@ jobs:
             exit 1
           fi
 
-      - name: Run smoke tests (forced to fail)
+      - name: Run smoke tests
         id: smoke-tests
         run: |
           cd source/tests
           npm install
-          # Run the tests but force a failure regardless of result
-          TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests || true
-          echo "Purposely failing smoke test to verify ECR cleanup"
-          exit 1
+          TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests
       
       # If tests pass, promote the image by re-tagging, if tests fail, delete the test image
       - name: Promote or delete image based on test results
