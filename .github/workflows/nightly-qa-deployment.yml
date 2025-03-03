@@ -2,7 +2,7 @@ name: Nightly QA Deployment
 
 on:
   schedule:
-    - cron: '30 1 * * *'  # Runs at 2 AM UTC daily
+    - cron: '00 8 * * *'  # Runs at midnight PST
   workflow_dispatch:     # Also allows manual triggering
 
 env:
@@ -180,12 +180,15 @@ jobs:
             exit 1
           fi
 
-      - name: Run smoke tests
+      - name: Run smoke tests (forced to fail)
         id: smoke-tests
         run: |
           cd source/tests
           npm install
-          TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests
+          # Run the tests but force a failure regardless of result
+          TEST_URL=http://${{ steps.launch-ec2.outputs.public_ip }} npm run smoke-tests || true
+          echo "Purposely failing smoke test to verify ECR cleanup"
+          exit 1
       
       # If tests pass, promote the image by re-tagging, if tests fail, delete the test image
       - name: Promote or delete image based on test results
